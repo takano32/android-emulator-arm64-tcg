@@ -210,8 +210,13 @@ tune_guest() {
   timeout 180 adb -s "$EMU_SERIAL" shell '
     su 0 sh -c '\''
       echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true
-      # Android 14 (HWC3) + swiftshader_indirect で DEVICE 合成が黒画面になるのを防ぎ CLIENT 合成へ固定
+      # Android 14 (HWC3) + swiftshader_indirect で DEVICE 合成が黒画面になるのを防ぎ CLIENT 合成へ固定し、
+      # 画面点灯・ロック解除・再描画 (1006) まで毎回確実に走らせる
       service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true
+      svc power stayon true >/dev/null 2>&1 || true
+      input keyevent 224 >/dev/null 2>&1 || true
+      wm dismiss-keyguard >/dev/null 2>&1 || true
+      service call SurfaceFlinger 1006 >/dev/null 2>&1 || true
       # TCG 下で IpReachabilityMonitor が AndroidWifi を切断しないようにし、
       # 未接続時は networkstack の全スレッド優先度を上げて 18 秒 DHCP タイムアウト内に接続させる
       cmd wifi set-ipreach-disconnect disabled >/dev/null 2>&1 || true
