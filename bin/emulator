@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# エミュレータ本体をサンドボックスの中でフォアグラウンド実行する。
+# 引数はそのまま emulator に渡る。バージョン確認やオプション調査、デバッグ用。
+#
+#   bin/emulator -version
+#   bin/emulator -list-avds
+#   bin/emulator -help
+#
+# 普段の起動・停止には bin/start と bin/stop を使う。
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+[ -x "$EMULATOR_BIN" ] || die "エミュレータ本体がありません。先に bin/setup を実行してください"
+mkdir -p "$AVD_HOME" "$SBX_HOME" "$SBX_TMP"
+
+# 呼び出し元（端末）が終了したらサンドボックスごと終了させる。
+SANDBOX_BWRAP_ARGS=(--die-with-parent)
+# 端末につながっているときは、サンドボックスの中から端末へ入力を注入されないよう
+# 別セッションにする。
+if [ -t 0 ]; then
+  SANDBOX_BWRAP_ARGS+=(--new-session)
+fi
+
+sandbox_exec "$EMULATOR_BIN" "$@"

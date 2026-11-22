@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+#
+# エミュレータをサンドボックスの中でバックグラウンド起動し、adb に認識されるまで待つ。
+#
+#   bin/start               adb devices に device として現れたら戻る
+#   bin/start --wait-boot   Android の起動完了 (sys.boot_completed=1) まで待ち、高速化設定を適用する
+#   bin/start --window      エミュレータ自身の GUI ウィンドウを表示する
+#   bin/start --headless    ウィンドウを表示せずヘッドレスで起動する
+#   bin/start --cold        スナップショットを読み込まずコールドブートする
+#   bin/start --no-wait     起動だけして戻る
+#   bin/start -- <引数...>  「--」より後ろはエミュレータへの追加引数
+#
+# すでに起動している場合は、起動し直さずに待つ処理だけを行う。
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+wait_mode=adb
+cold_boot=0
+window_mode="${EMU_WINDOW:-no}"
+extra_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wait-boot) wait_mode=boot ;;
+    --window) window_mode=yes ;;
+    --headless|--no-window) window_mode=no ;;
+    --cold) cold_boot=1 ;;
+    --no-wait) wait_mode=none ;;
+    --) shift; extra_args=("$@"); break ;;
+    -h|--help) sed -n '3,13s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) die "不明な引数: $1（bin/start --help を参照）" ;;
+  esac
+  shift
+done
+
+launch() {
+  local port
+  for port in "$EMU_CONSOLE_PORT" "$EMU_ADB_PORT"; do
+    if port_in_use "$port"; then
+      die "ポート $port が使用中です。別のエミュレータが動いていないか確認するか、config.local.sh で EMU_CONSOLE_PORT を変えてください"
+    fi
+  done
+
+  # adb サーバーはサンドボックスの外（普段の環境）で動かす。先に起動しておかないと、
+  # エミュレータが内部で呼ぶ adb がサンドボックス内に別のサーバーを立ててしまう。
+  adb start-server
+
+  # ホストの adb 公開鍵（秘密鍵ではない）を渡す。エミュレータが初回起動時に
+  # ゲストへ登録するので、adb devices で unauthorized にならない。
+  if [ -f "$HOME/.android/adbkey.pub" ]; then
+    install -D -m 644 "$HOME/.android/adbkey.pub" "$SBX_HOME/.android/adbkey.pub"
+  else
+    log "warning: ~/.android/adbkey.pub がありません。adb で unauthorized になる場合があります"
+  fi
+
+  mkdir -p "$LOG_DIR" "$RUN_DIR" "$SBX_TMP"
+  if [ -f "$EMU_LOG" ]; then mv -f "$EMU_LOG" "$EMU_LOG.1"; fi
+  rm -f "$PID_FILE"
+
+  # 前回が強制終了だと AVD のロックが残る。ロックには PID が書かれているが、サンドボックス内では
+  # エミュレータの PID が毎回同じ (2) になるため、残ったロックを「起動中」と誤認して起動を拒否する。
+  # ここに来るのは動いていないことを確かめた後なので、消してよい。
+  rm -f "$AVD_DIR/hardware-qemu.ini.lock" "$AVD_DIR/multiinstance.lock" "$AVD_DIR/snapshot.lock.lock" "$AVD_DIR"/*.lock
+
+  if [ "$AVD_RAM_MB" -gt 3056 ] 2>/dev/null; then
+    die "AVD_RAM_MB=$AVD_RAM_MB は上限 (3056 MB) を超えています。arm64 ranchu の ramoops 領域 (0xff018000) と重なりゲストカーネルがパニックするため、1536 または 2048 にしてください"
+  fi
+
+  # config.sh の画面解像度・スナップショット設定を既存の config.ini にも反映する（/data は維持）。
+  local force_cold="yes" force_fast="no"
+  if [ "${AVD_SNAPSHOT:-no}" = "yes" ]; then
+    force_cold="no"
+    force_fast="yes"
+  fi
+  if [ -f "$AVD_DIR/config.ini" ]; then
+    sed -i \
+      -e "s/^hw\.lcd\.width[[:space:]]*=.*/hw.lcd.width = $AVD_LCD_WIDTH/" \
+      -e "s/^hw\.lcd\.height[[:space:]]*=.*/hw.lcd.height = $AVD_LCD_HEIGHT/" \
+      -e "s/^hw\.lcd\.density[[:space:]]*=.*/hw.lcd.density = $AVD_LCD_DENSITY/" \
+      -e "s/^skin\.name[[:space:]]*=.*/skin.name = ${AVD_LCD_WIDTH}x${AVD_LCD_HEIGHT}/" \
+      -e "s/^fastboot\.forceColdBoot[[:space:]]*=.*/fastboot.forceColdBoot = $force_cold/" \
+      -e "s/^fastboot\.forceFastBoot[[:space:]]*=.*/fastboot.forceFastBoot = $force_fast/" \
+      "$AVD_DIR/config.ini"
+  fi
+
+  # エミュレータは「-qemu」より後ろの引数をすべて QEMU 本体に渡す。こちらが足す QEMU 向けの
+  # 引数と両立するよう、追加引数も -qemu の前後で分けておく。
+  local -a extra_emu=() extra_qemu=()
+  local arg after_qemu=0
+  for arg in "${extra_args[@]}"; do
+    if [ "$after_qemu" = 0 ] && [ "$arg" = -qemu ]; then
+      after_qemu=1
+    elif [ "$after_qemu" = 1 ]; then
+      extra_qemu+=("$arg")
+    else
+      extra_emu+=("$arg")
+    fi
+  done
+
+  # ゲストのカーネルに mem= を渡して、使うメモリを AVD_RAM_MB に抑える。-memory だけでは、
+  # エミュレータがイメージごとの下限（API 31 では 2048）まで勝手に引き上げてしまう。
+  local -a qemu_args=(-append "mem=${AVD_RAM_MB}M")
+  if [ -n "$TCG_CACHE_MB" ]; then
+    qemu_args+=(-tb-size "$TCG_CACHE_MB")
+  fi
+
+  local -a snapshot_args=()
+  if [ "${AVD_SNAPSHOT:-no}" != "yes" ]; then
+    snapshot_args+=(-no-snapshot)
+  elif [ "$cold_boot" = 1 ]; then
+    snapshot_args+=(-no-snapshot-load)
+  fi
+
+  local -a window_args=(-no-window)
+  if [ "$window_mode" = yes ]; then
+    if compgen -G "/tmp/.X11-unix/X*" >/dev/null; then
+      window_args=(-fixed-scale)
+      if [ -f "$AVD_DIR/emulator-user.ini" ]; then
+        if grep -q '^window\.scale[[:space:]]*=' "$AVD_DIR/emulator-user.ini"; then
+          sed -i 's/^window\.scale[[:space:]]*=.*/window.scale = 1.000000/' "$AVD_DIR/emulator-user.ini"
+        else
+          printf 'window.scale = 1.000000\n' >>"$AVD_DIR/emulator-user.ini"
+        fi
+      fi
+    else
+      log "warning: X11 ソケット (/tmp/.X11-unix/X*) が見つからないためヘッドレス (-no-window) で起動します"
+    fi
+  fi
+
+  local -a emu_args=(
+    "@$AVD_NAME"
+    -port "$EMU_CONSOLE_PORT"
+    -memory "$AVD_RAM_MB"
+    -cores "$AVD_CORES"
+    -accel off                    # KVM が無いので CPU はソフトウェアエミュレーション (TCG)
+    -gpu swiftshader_indirect     # GPU も無いので描画はソフトウェア
+    "${window_args[@]}" -no-audio -no-boot-anim
+    "${snapshot_args[@]}"
+    -no-metrics
+    -show-kernel                  # カーネルログをログファイルに出す（起動の進み具合が分かる）
+    "${extra_emu[@]}"
+    -qemu "${qemu_args[@]}" "${extra_qemu[@]}"
+  )
+
+  # setsid で端末から切り離す。bash はそのまま bwrap に exec されるので、
+  # ここで記録する PID がサンドボックス（＝セッションとプロセスグループ）の PID になる。
+  # shellcheck disable=SC2016
+  setsid -f bash -c '
+    source "$1/lib/common.sh"
+    shift
+    echo "$$" >"$PID_FILE"
+    sandbox_exec "$EMULATOR_BIN" "$@"
+  ' _ "$REPO_ROOT" "${emu_args[@]}" </dev/null >"$EMU_LOG" 2>&1
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if emu_pid >/dev/null; then break; fi
+    sleep 0.5
+  done
+  emu_pid >/dev/null || die "エミュレータを起動できませんでした。ログ: $EMU_LOG"
+  log "起動しました (pid $(emu_pid))  ログ: ${EMU_LOG#"$REPO_ROOT"/}"
+  pin_cpus "$(emu_pid)"
+}
+
+# ランチャーが決めた CPU 固定を上書きする（理由は config.sh の EMU_CPUS の説明）。
+pin_cpus() {
+  local sandbox_pid="$1" cpus="$EMU_CPUS" pid="" allowed i
+  if [ "$cpus" = auto ]; then cpus="$(fastest_cpus)"; fi
+  [ -n "$cpus" ] || return 0
+  need_cmd taskset pgrep
+
+  # ランチャーは自分を固定してから QEMU 本体に exec するので、exec を待って上書きする。
+  for i in $(seq 40); do
+    if pid="$(qemu_pid "$sandbox_pid")"; then break; fi
+    emu_pid >/dev/null || return 0
+    sleep 0.5
+  done
+  if [ -z "$pid" ]; then
+    log "warning: QEMU のプロセスが見つからず、CPU を固定できませんでした"
+    return 0
+  fi
+
+  # 固定している最中に増えたスレッドを取りこぼさないよう、全スレッドが揃うまで繰り返す。
+  for i in 1 2 3 4 5; do
+    if ! taskset --all-tasks --cpu-list --pid "$cpus" "$pid" >/dev/null 2>&1; then
+      log "warning: CPU $cpus への固定に失敗しました（そのまま続行します）"
+      return 0
+    fi
+    allowed="$(awk '/^Cpus_allowed_list:/ { print $2 }' "/proc/$pid/status")"
+    if ! grep -h '^Cpus_allowed_list:' "/proc/$pid"/task/*/status 2>/dev/null |
+         awk -v want="$allowed" '$2 != want { found = 1 } END { exit !found }'; then
+      log "CPU $allowed に固定しました"
+      return 0
+    fi
+    sleep 0.2
+  done
+  log "warning: 一部のスレッドを CPU $cpus に固定できませんでした"
+}
+
+adb_is_device() { [ "$(adb_state)" = device ]; }
+
+boot_completed() {
+  local value
+  value="$(timeout 30 adb -s "$EMU_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')" || return 1
+  [ "$value" = 1 ]
+}
+
+# 起動完了後にゲスト内の描画負荷・バックグラウンド負荷を下げる設定を適用する。
+tune_guest() {
+  log "ゲストの高速化設定を適用しています..."
+  timeout 180 adb -s "$EMU_SERIAL" shell '
+    su 0 sh -c '\''
+      echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true
+      # Android 14 (HWC3) + swiftshader_indirect で DEVICE 合成が黒画面になるのを防ぎ CLIENT 合成へ固定
+      service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true
+      # TCG 下で IpReachabilityMonitor が AndroidWifi を切断しないようにし、
+      # 未接続時は networkstack の全スレッド優先度を上げて 18 秒 DHCP タイムアウト内に接続させる
+      cmd wifi set-ipreach-disconnect disabled >/dev/null 2>&1 || true
+      if ! ip -4 addr show wlan0 2>/dev/null | grep -q "inet "; then
+        for name in com.android.networkstack.process wpa_supplicant android.hardware.wifi-service; do
+          for p in $(pidof "$name" 2>/dev/null); do
+            for t in /proc/"$p"/task/*; do renice -n -20 -p "${t##*/}" >/dev/null 2>&1 || true; done
+          done
+        done
+        cmd wifi add-network AndroidWifi open >/dev/null 2>&1 || true
+        cmd wifi connect-network AndroidWifi open >/dev/null 2>&1 || true
+      fi
+      setprop ctl.stop vendor.ril-daemon
+      setprop ctl.stop bt_vhci_forwarder
+      cmd package bg-dexopt-job --cancel >/dev/null 2>&1 || true
+      # settings put / pm disable は永続化されるため初回のみ適用する。
+      # 毎回 pm disable を叩くと PACKAGE_CHANGED ブロードキャストが飛んで GMS が再処理嵐を起こす。
+      # また GMS 内部サービスの pm disable は自己修復と衝突して無限ループするため絶対に行わない。
+      if [ ! -f /data/local/tmp/.guest_tuned_v50 ]; then
+        settings put global window_animation_scale 0
+        settings put global transition_animation_scale 0
+        settings put global animator_duration_scale 0
+        settings put global disable_window_blurs 1
+        settings put global hide_error_dialogs 1
+        settings put secure anr_show_background 0
+        settings put system accelerometer_rotation 0
+        settings put system sound_effects_enabled 0
+        settings put global activity_manager_constants max_cached_processes=2,background_settle_time=5000
+        settings put global airplane_mode_on 0
+        settings put system screen_off_timeout 2147483647
+        settings put system screen_brightness_mode 0
+        settings put system screen_brightness 200
+        svc power stayon true >/dev/null 2>&1 || true
+        svc bluetooth disable >/dev/null 2>&1 || true
+        settings put global device_provisioned 1
+        settings put secure user_setup_complete 1
+        settings put secure location_mode 0
+        settings put global wifi_scan_always_enabled 0
+        settings put global ble_scan_always_enabled 0
+        # GMS の DeviceConfig/Phenotype 再試行嵐による常時 40-50% CPU 消費と lmkd --reinit 連発を抑止
+        device_config set_sync_disabled_for_tests persistent >/dev/null 2>&1 || true
+        cmd wifi connect-network AndroidWifi open >/dev/null 2>&1 || true
+        # Google サインイン画面 (MinuteMaidActivity) の WebView 読み込みタイムアウト (既定 90 秒) を TCG 下向けに 600 秒へ延長
+        am broadcast -a com.google.gservices.intent.action.GSERVICES_OVERRIDE --es auth_minute_maid_timeout 600000 >/dev/null 2>&1 || true
+        pm disable com.google.android.sdksetup/.DefaultActivity >/dev/null 2>&1 || true
+        pm disable com.google.android.googlesdksetup/.DefaultActivity >/dev/null 2>&1 || true
+        pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true
+        pm disable-user --user 0 com.google.android.bluetooth >/dev/null 2>&1 || true
+        # Gboard は待機中でも音声/辞書パック更新で 140 MB・50% CPU を消費するため無効化
+        # （物理キーボード入力はそのまま使える。ソフトキーボードが要れば pm enable で復帰可）。
+        pm disable-user --user 0 com.google.android.inputmethod.latin >/dev/null 2>&1 || true
+        touch /data/local/tmp/.guest_tuned_v50
+      fi
+    '\''
+  ' >/dev/null 2>&1 || log "warning: 一部のゲスト高速化設定の適用をスキップしました"
+}
+
+# wait_until 待つ対象 上限秒 判定関数 判定の間隔秒
+wait_until() {
+  local what="$1" limit="$2" check="$3" interval="$4"
+  local start=$SECONDS elapsed=0 next_report=30
+  log "${what}を待っています（上限 ${limit} 秒）..."
+  until "$check"; do
+    emu_pid >/dev/null || die "エミュレータが終了しました。ログを確認してください: $EMU_LOG"
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge "$limit" ]; then
+      die "${limit} 秒待ちましたが、${what}に至りませんでした。エミュレータは動かしたままです（bin/status で状態確認、bin/stop で停止）"
+    fi
+    if [ "$elapsed" -ge "$next_report" ]; then
+      log "  ... ${elapsed} 秒経過（adb: $(adb_state | grep . || echo 未認識)）"
+      next_report=$((next_report + 30))
+    fi
+    sleep "$interval"
+  done
+  log "  → ${what}: $((SECONDS - start)) 秒"
+}
+
+require_setup
+need_cmd adb setsid
+
+if pid="$(emu_pid)"; then
+  log "すでに起動しています (pid $pid)"
+else
+  launch
+fi
+
+case "$wait_mode" in
+  none) exit 0 ;;
+  # adb の状態はホスト側の問い合わせだけで分かるので細かく見る。起動完了の確認は
+  # ゲスト内でシェルを動かす（遅いゲストには負荷になる）ので間隔を空ける。
+  adb)  wait_until "adb での認識" "$ADB_WAIT_TIMEOUT" adb_is_device 3 ;;
+  boot) wait_until "adb での認識" "$ADB_WAIT_TIMEOUT" adb_is_device 3
+        wait_until "Android の起動完了" "$BOOT_WAIT_TIMEOUT" boot_completed 20
+        tune_guest ;;
+esac
+
+if pid="$(emu_pid)"; then
+  log "エミュレータの起動からの経過時間: $(ps -o etime= -p "$pid" | tr -d ' ')"
+fi
+adb devices -l | awk -v s="$EMU_SERIAL" 'NR == 1 || $1 == s'

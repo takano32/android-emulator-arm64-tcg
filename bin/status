@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# エミュレータの状態（プロセス / adb での認識 / Android の起動状況）を表示する。
+# 終了コード: 0 = adb に device として認識されている、1 = それ以外
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+if [ $# -gt 0 ]; then
+  case "$1" in
+    -h|--help) sed -n '3,4s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) die "不明な引数: $1" ;;
+  esac
+fi
+
+# 見出しは桁を揃えるため ASCII にしている。
+row() { printf '%-9s %s\n' "$1" "$2"; }
+guest_prop() { timeout 30 adb -s "$EMU_SERIAL" shell getprop "$1" 2>/dev/null | tr -d '\r\n'; }
+
+if pid="$(emu_pid)"; then
+  # サンドボックス内のプロセスは同じセッションに属するので、セッション単位で集計する。
+  rss_kb="$(ps -o rss= --sid "$pid" | awk '{ sum += $1 } END { print sum + 0 }')"
+  row process "起動中 (pid $pid, 稼働 $(ps -o etime= -p "$pid" | tr -d ' '), メモリ $((rss_kb / 1024)) MiB)"
+else
+  row process "停止中"
+fi
+
+state="$(adb_state)"
+row adb "${EMU_SERIAL} ${state:-（未認識）}"
+
+if [ "$state" = device ]; then
+  if [ "$(guest_prop sys.boot_completed)" = 1 ]; then
+    row android "起動完了 (Android $(guest_prop ro.build.version.release) / API $(guest_prop ro.build.version.sdk))"
+  else
+    row android "起動処理中（sys.boot_completed がまだ 1 になっていない）"
+  fi
+fi
+
+row avd "$AVD_NAME (android-$SYSIMG_API / $SYSIMG_TAG / $SYSIMG_ABI)"
+row log "${EMU_LOG#"$REPO_ROOT"/}"
+
+[ "$state" = device ]

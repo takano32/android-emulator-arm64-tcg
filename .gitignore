@@ -1,0 +1,10 @@
+# bin/setup が取得・生成するもの（エミュレータ本体、システムイメージ、AVD、ログ）。
+# すべて config.sh の定義から再現できるので git には入れない。
+/var/
+
+# 手元だけの設定上書き
+/config.local.sh
+
+# Python バイトコードキャッシュ
+__pycache__/
+*.pyc

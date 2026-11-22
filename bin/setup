@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+#
+# エミュレータ本体とシステムイメージを取得・検証・展開し、AVD を作る。
+# 何度実行してもよい（取得済み・展開済みのものはスキップする）。
+#
+#   bin/setup                 通常のセットアップ
+#   bin/setup --recreate-avd  AVD を作り直す（エミュレータ内のデータは消える）
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+recreate_avd=0
+for arg in "$@"; do
+  case "$arg" in
+    --recreate-avd) recreate_avd=1 ;;
+    -h|--help) sed -n '3,8s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) die "不明な引数: $arg（bin/setup --help を参照）" ;;
+  esac
+done
+
+# fetch_verified URL FILE SHA256
+# 取得して SHA-256 を照合する。一致しないものは残さない。
+fetch_verified() {
+  local url="$1" file="$2" sha256="$3"
+  if [ -f "$file" ] && echo "$sha256  $file" | sha256sum --check --status; then
+    log "  取得済み: ${file#"$REPO_ROOT"/}"
+    return
+  fi
+  log "  取得中: $url"
+  curl --fail --location --proto '=https' --proto-redir '=https' \
+       --retry 3 --progress-bar --output "$file.part" "$url"
+  if ! echo "$sha256  $file.part" | sha256sum --check --status; then
+    local actual
+    actual="$(sha256sum "$file.part" | cut -d' ' -f1)"
+    rm -f "$file.part"
+    die "SHA-256 が一致しません: $url
+  期待: $sha256
+  実際: $actual"
+  fi
+  mv "$file.part" "$file"
+  log "  検証 OK (sha256): ${file#"$REPO_ROOT"/}"
+}
+
+# 展開済みかどうかは、展開元アーカイブの SHA-256 を書いた目印ファイルで判定する。
+is_installed() { [ "$(cat "$1/.installed-from" 2>/dev/null)" = "$2" ]; }
+mark_installed() { printf '%s\n' "$2" >"$1/.installed-from"; }
+
+install_emulator() {
+  log "[1/4] エミュレータ本体 $EMULATOR_VERSION"
+  fetch_verified "$EMULATOR_URL" "$DL_DIR/$EMULATOR_ARCHIVE" "$EMULATOR_SHA256"
+  if is_installed "$EMULATOR_DIR" "$EMULATOR_SHA256"; then
+    log "  展開済み: ${EMULATOR_DIR#"$REPO_ROOT"/}"
+    return
+  fi
+  if emu_pid >/dev/null; then
+    die "エミュレータが起動中です。bin/stop で止めてから実行してください"
+  fi
+  rm -rf "$EMULATOR_DIR"
+  tar --extract --file "$DL_DIR/$EMULATOR_ARCHIVE" --directory "$SDK_DIR" \
+      --no-same-owner --no-same-permissions
+  [ -x "$EMULATOR_BIN" ] || die "アーカイブに emulator/emulator がありません"
+  mark_installed "$EMULATOR_DIR" "$EMULATOR_SHA256"
+  log "  展開: ${EMULATOR_DIR#"$REPO_ROOT"/}"
+}
+
+playstore_stamp() {
+  if [ -n "${PLAYSTORE_URL:-}" ] || [ -n "${SYSPROP_TIMEOUT_MS:-}" ]; then
+    printf 'v5.0-api34:debloat+vendor+vintf-radio-aidl:%s:%s:%s\n' \
+      "$SYSIMG_SHA256" "${PLAYSTORE_SHA256:-none}" "${SYSPROP_TIMEOUT_MS:-default}"
+  fi
+}
+
+install_sysimg() {
+  log "[2/4] システムイメージ android-$SYSIMG_API / $SYSIMG_TAG / $SYSIMG_ABI"
+  fetch_verified "$SYSIMG_URL" "$DL_DIR/$SYSIMG_ARCHIVE" "$SYSIMG_SHA256"
+  local cur_ps want_ps
+  cur_ps="$(cat "$SYSIMG_DIR/.playstore-from" 2>/dev/null || true)"
+  want_ps="$(playstore_stamp)"
+  # すでに別条件でパッチ済み（またはパッチ無効化）なら素のイメージを展開し直す。
+  if is_installed "$SYSIMG_DIR" "$SYSIMG_SHA256" && { [ -z "$cur_ps" ] || [ "$cur_ps" = "$want_ps" ]; }; then
+    log "  展開済み: ${SYSIMG_DIR#"$REPO_ROOT"/}"
+    return
+  fi
+  if emu_pid >/dev/null; then
+    die "エミュレータが起動中です。bin/stop で止めてから実行してください"
+  fi
+  rm -rf "$SYSIMG_DIR"
+  mkdir -p "$(dirname "$SYSIMG_DIR")"
+  # アーカイブの最上位は ABI 名のディレクトリ（arm64-v8a/）ひとつ。
+  unzip -q -o "$DL_DIR/$SYSIMG_ARCHIVE" -d "$(dirname "$SYSIMG_DIR")"
+  [ -f "$SYSIMG_DIR/system.img" ] ||
+    die "アーカイブに $SYSIMG_ABI/system.img がありません（SYSIMG_ABI の設定を確認）"
+  mark_installed "$SYSIMG_DIR" "$SYSIMG_SHA256"
+  log "  展開: ${SYSIMG_DIR#"$REPO_ROOT"/}"
+}
+
+install_playstore() {
+  log "[3/4] システムイメージの調整（Google Play ストア / sys_prop タイムアウト）"
+  local want_ps
+  want_ps="$(playstore_stamp)"
+  if [ -z "$want_ps" ]; then
+    log "  スキップ（PLAYSTORE_URL・SYSPROP_TIMEOUT_MS がともに空のため）"
+    return
+  fi
+  local -a patch_args=(--target "$SYSIMG_DIR/system.img" --tmp-dir "$SBX_TMP")
+  if [ -n "${PLAYSTORE_URL:-}" ]; then
+    fetch_verified "$PLAYSTORE_URL" "$DL_DIR/$PLAYSTORE_ARCHIVE" "$PLAYSTORE_SHA256"
+    patch_args+=(--playstore-zip "$DL_DIR/$PLAYSTORE_ARCHIVE")
+  fi
+  if [ -n "${SYSPROP_TIMEOUT_MS:-}" ]; then
+    patch_args+=(--sysprop-timeout-ms "$SYSPROP_TIMEOUT_MS")
+  fi
+  if [ "$(cat "$SYSIMG_DIR/.playstore-from" 2>/dev/null || true)" = "$want_ps" ]; then
+    log "  適用済み: ${SYSIMG_DIR#"$REPO_ROOT"/}/system.img"
+    return
+  fi
+  if emu_pid >/dev/null; then
+    die "エミュレータが起動中です。bin/stop で止めてから実行してください"
+  fi
+  need_cmd python3 lpdump lpmake debugfs
+  if [ -n "${PLAYSTORE_URL:-}" ]; then
+    need_cmd tune2fs resize2fs e2fsck
+  fi
+  python3 "$REPO_ROOT/lib/inject-playstore.py" "${patch_args[@]}"
+  printf '%s\n' "$want_ps" >"$SYSIMG_DIR/.playstore-from"
+}
+
+# タイムアウトの倍率を、イメージ同梱の初期データに書き込む（理由は config.sh の HW_TIMEOUT_MULTIPLIER）。
+# エミュレータは AVD の初回起動時に <イメージ>/data/ から /data を作り、userdebug ビルドの init は
+# 起動のたびに /data/local.prop を読んでプロパティを設定する。Google 自身もこのファイルで
+# ro.test_harness などを設定している。
+apply_timeout_multiplier() {
+  local file="$SYSIMG_DIR/data/local.prop"
+  mkdir -p "$SYSIMG_DIR/data"
+  touch "$file"
+  sed -i \
+    -e '/^ro\.hw_timeout_multiplier=/d' \
+    -e '/^ro\.llk\.enable=/d' \
+    -e '/^ro\.khungtask\.enable=/d' \
+    -e '/^ro\.radio\.noril=/d' \
+    -e '/^persist\.sys\.zram_enabled=/d' \
+    -e '/^debug\.sf\.nobootanimation=/d' \
+    -e '/^ro\.surface_flinger\.supports_background_blur=/d' \
+    -e '/^dalvik\.vm\.dex2oat-threads=/d' \
+    -e '/^apexd\.config\.dm_create\.timeout=/d' \
+    -e '/^apexd\.config\.dm_delete\.timeout=/d' \
+    -e '/^apexd\.config\.loop_wait\.attempts=/d' \
+    -e '/^apexd\.config\.boot_activation\.threads=/d' \
+    "$file"
+  if [ -n "$HW_TIMEOUT_MULTIPLIER" ]; then
+    printf 'ro.hw_timeout_multiplier=%s\n' "$HW_TIMEOUT_MULTIPLIER" >>"$file"
+  fi
+  cat >>"$file" <<'EOF'
+ro.llk.enable=false
+ro.khungtask.enable=false
+ro.radio.noril=yes
+persist.sys.zram_enabled=1
+debug.sf.nobootanimation=1
+ro.surface_flinger.supports_background_blur=0
+dalvik.vm.dex2oat-threads=2
+apexd.config.dm_create.timeout=30000
+apexd.config.dm_delete.timeout=30000
+apexd.config.loop_wait.attempts=30
+apexd.config.boot_activation.threads=1
+EOF
+  log "  ゲスト初期プロパティ (data/local.prop): タイムアウト倍率=${HW_TIMEOUT_MULTIPLIER:-なし}, apexd dm タイムアウト=30s/1スレッド, llkd/ril/ブラー無効, zram有効, dex2oat=2スレッド"
+}
+
+create_avd() {
+  log "[4/4] AVD '$AVD_NAME'"
+  if [ "$recreate_avd" = 1 ]; then
+    if emu_pid >/dev/null; then
+      die "エミュレータが起動中です。bin/stop で止めてから実行してください"
+    fi
+    rm -rf "$AVD_DIR"
+    log "  既存の AVD を削除しました"
+  fi
+
+  # <name>.ini は AVD の場所を絶対パスで指すので毎回書き直す
+  # （リポジトリを移動したあとも bin/setup を実行し直せば追従する）。
+  cat >"$AVD_INI" <<EOF
+avd.ini.encoding=UTF-8
+path=$AVD_DIR
+target=android-$SYSIMG_API
+EOF
+
+  local force_cold="yes" force_fast="no"
+  if [ "${AVD_SNAPSHOT:-no}" = "yes" ]; then
+    force_cold="no"
+    force_fast="yes"
+  fi
+
+  if [ -f "$AVD_DIR/config.ini" ]; then
+    # 画面解像度・密度・スナップショット設定は /data を消さずに既存 config.ini へ反映する。
+    sed -i \
+      -e "s/^hw\.lcd\.width=.*/hw.lcd.width=$AVD_LCD_WIDTH/" \
+      -e "s/^hw\.lcd\.height=.*/hw.lcd.height=$AVD_LCD_HEIGHT/" \
+      -e "s/^hw\.lcd\.density=.*/hw.lcd.density=$AVD_LCD_DENSITY/" \
+      -e "s/^skin\.name=.*/skin.name=${AVD_LCD_WIDTH}x${AVD_LCD_HEIGHT}/" \
+      -e "s/^fastboot\.forceColdBoot=.*/fastboot.forceColdBoot=$force_cold/" \
+      -e "s/^fastboot\.forceFastBoot=.*/fastboot.forceFastBoot=$force_fast/" \
+      "$AVD_DIR/config.ini"
+    log "  作成済み: ${AVD_DIR#"$REPO_ROOT"/}（画面 ${AVD_LCD_WIDTH}x${AVD_LCD_HEIGHT}@${AVD_LCD_DENSITY}dpi, snapshot=${AVD_SNAPSHOT:-no} を反映）"
+    return
+  fi
+  mkdir -p "$AVD_DIR"
+  # avdmanager を使わずに直接書く（Java も cmdline-tools も不要にするため）。
+  # ここに無い項目はエミュレータが既定値で補い、起動時に hardware-qemu.ini へ書き出す。
+  # メモリと仮想 CPU 数は、bin/start が起動のたびに引数で渡すのでここには書かない。
+  cat >"$AVD_DIR/config.ini" <<EOF
+AvdId=$AVD_NAME
+avd.ini.displayname=$AVD_NAME
+avd.ini.encoding=UTF-8
+PlayStore.enabled=false
+abi.type=$SYSIMG_ABI
+hw.cpu.arch=arm64
+image.sysdir.1=$SYSIMG_REL/
+tag.id=$SYSIMG_TAG
+tag.display=$SYSIMG_TAG_DISPLAY
+disk.dataPartition.size=$AVD_DATA_SIZE
+hw.lcd.width=$AVD_LCD_WIDTH
+hw.lcd.height=$AVD_LCD_HEIGHT
+hw.lcd.density=$AVD_LCD_DENSITY
+hw.initialOrientation=portrait
+skin.name=${AVD_LCD_WIDTH}x${AVD_LCD_HEIGHT}
+skin.dynamic=yes
+showDeviceFrame=no
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.keyboard=yes
+hw.audioInput=no
+hw.audioOutput=no
+hw.camera.back=none
+hw.camera.front=none
+hw.sdCard=no
+hw.gsmModem=no
+hw.gps=no
+hw.accelerometer=no
+hw.accelerometer_uncalibrated=no
+hw.gyroscope=no
+hw.sensors.light=no
+hw.sensors.pressure=no
+hw.sensors.humidity=no
+hw.sensors.proximity=no
+hw.sensors.magnetic_field=no
+hw.sensors.magnetic_field_uncalibrated=no
+hw.sensors.gyroscope_uncalibrated=no
+hw.sensors.orientation=no
+hw.sensors.temperature=no
+fastboot.forceColdBoot=$force_cold
+fastboot.forceFastBoot=$force_fast
+EOF
+  log "  作成: ${AVD_DIR#"$REPO_ROOT"/}"
+}
+
+[ "$(uname -sm)" = "Linux aarch64" ] ||
+  die "このリポジトリは Linux aarch64 専用です（検出: $(uname -sm)）。x86_64 なら公式の Android SDK を使ってください"
+need_cmd curl tar xz unzip sha256sum bwrap adb
+
+mkdir -p "$DL_DIR" "$SDK_DIR" "$AVD_HOME" "$SBX_HOME" "$SBX_TMP" "$LOG_DIR" "$RUN_DIR"
+
+# エミュレータは、SDK ルートに platforms/ と platform-tools/ が無いと起動を拒否する。
+# adb は OS のパッケージのものを使うので、中身はシンボリックリンクだけでよい。
+mkdir -p "$SDK_DIR/platforms" "$SDK_DIR/platform-tools"
+ln -sfn "$(command -v adb)" "$SDK_DIR/platform-tools/adb"
+
+install_emulator
+install_sysimg
+install_playstore
+apply_timeout_multiplier
+create_avd
+
+log ""
+log "セットアップ完了。bin/start でエミュレータを起動できます。"
