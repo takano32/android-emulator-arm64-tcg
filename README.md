@@ -24,7 +24,7 @@ adb devices    # → emulator-5554   device
 | `bin/start --cold` | スナップショットを読み込まずにコールドブートする |
 | `bin/status` | プロセス・adb での認識・Android の起動状況を表示する |
 | `bin/screen` | `scrcpy` でエミュレータの画面をウィンドウに表示し、マウス・キーボードで操作する |
-| `bin/stop` | エミュレータを停止する |
+| `bin/stop` | 停止前にゲストの未書き込みデータをディスクへ反映し、エミュレータを停止する |
 | `bin/emulator <引数>` | エミュレータ本体をサンドボックス内で直接実行する（`-version`、`-help` などの確認用） |
 
 起動後は普段どおり `adb` を使う。シリアルは既定で `emulator-5554`（`config.local.sh` でポートを変えた場合はそちら）。

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
 # エミュレータを停止する。
-# まずエミュレータのコンソールに kill を送り、終了しなければシグナルで止める。
+# 停止前にゲストの未書き込みデータをディスクへ反映し、コンソールに kill を送る。
+# 終了しなければシグナルで止める。
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 if [ $# -gt 0 ]; then
   case "$1" in
-    -h|--help) sed -n '3,4s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '3,5s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "不明な引数: $1" ;;
   esac
 fi
@@ -25,15 +26,33 @@ console_kill() {
   ) >/dev/null 2>&1
 }
 
+# 停止前にゲストの未書き込みデータをディスクへ反映する。TCG では sync 自体に
+# 数秒かかることがあるため上限を設け、失敗しても停止は続行する。
+sync_guest() {
+  local state
+  state="$(adb_state)"
+  if [ "$state" != device ]; then
+    log "warning: adb の状態が '${state:-未認識}' のため、ゲストの書き込みを同期できません"
+    return 0
+  fi
+  log "ゲストの書き込みをディスクへ反映します"
+  if ! timeout 120 adb -s "$EMU_SERIAL" shell sync; then
+    log "warning: ゲストの同期に失敗しました（そのまま停止します）"
+  fi
+}
+
 if ! pid="$(emu_pid)"; then
   if port_in_use "$EMU_CONSOLE_PORT"; then
     log "PID ファイルが見つかりませんがポート $EMU_CONSOLE_PORT のエミュレータを停止します"
+    sync_guest
     console_kill || true
     deadline=$((SECONDS + 30))
     while port_in_use "$EMU_CONSOLE_PORT"; do
       [ "$SECONDS" -lt "$deadline" ] || die "ポート $EMU_CONSOLE_PORT のエミュレータを停止できませんでした"
       sleep 1
     done
+    # QEMU は終了時に qcow2 を閉じるが、ホスト側のページキャッシュに残った分も書き出す。
+    sync
     rm -f "$PID_FILE"
     log "停止しました"
     exit 0
@@ -52,6 +71,7 @@ wait_gone() {
   done
 }
 
+sync_guest
 log "エミュレータを停止します (pid $pid)"
 console_kill || true
 # スナップショット有効時は終了時に RAM 状態を保存するため 120 秒まで待つ
@@ -64,5 +84,7 @@ if ! wait_gone 120; then
     wait_gone 10 || die "プロセスを停止できませんでした (pid $pid)"
   fi
 fi
+# QEMU は終了時に qcow2 を閉じるが、ホスト側のページキャッシュに残った分も書き出す。
+sync
 rm -f "$PID_FILE"
 log "停止しました"
